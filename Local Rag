@@ -1,0 +1,490 @@
+import re
+import json
+from collections import Counter
+
+import numpy as np
+import streamlit as st
+import sqlite3
+from openai import OpenAI
+from pypdf import PdfReader
+import pdfplumber
+
+PORT = 51592
+client = OpenAI(base_url=f"http://127.0.0.1:{PORT}/v1", api_key="local-key")
+
+DB_PATH = "ingest.db"
+
+EMBED_MODEL = "qwen3-embedding-0.6b"
+CHAT_MODEL = "qwen2.5-1.5b"
+
+NOT_FOUND_MARKER = "YETERLI_BILGI_YOK"
+MIN_SEMANTIC_SCORE = 0.20 
+
+
+class EmbeddingError(Exception):
+    """Embedding/chat sunucusuna erişilemediğinde fırlatılır."""
+    pass
+
+
+def dejenere_tekrar_mi(text, parca_uzunlugu=40, tekrar_esigi=3):
+    """Küçük yerel modeller bazen belirsiz/eşleşmesiz sorularda 'takılıp'
+    aynı ifadeyi (genellikle prompt'taki talimat cümlelerinden birini)
+    defalarca art arda tekrarlayabiliyor (degenerate repetition). Bu
+    fonksiyon metinde aynı ~40+ karakterlik bir parçanın 3+ kez geçip
+    geçmediğini kontrol eder. Tekrarın öncesinde kalan kısım da genelde
+    gerçek bir cevap değil (aynı döngünün ilk kopyası) olduğundan, burada
+    kırpma yapmıyoruz — sadece True/False dönüyoruz; çağıran taraf tekrar
+    tespit edilirse net bir hata mesajı gösterir."""
+    if not text or len(text) < parca_uzunlugu * tekrar_esigi:
+        return False
+    for i in range(0, len(text) - parca_uzunlugu):
+        parca = text[i:i + parca_uzunlugu]
+        if text.count(parca) >= tekrar_esigi:
+            return True
+    return False
+
+
+def cosine_similarity(v1, v2):
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (n1 * n2))
+
+
+def turkish_lower(text):
+    """str.lower() Türkçe İ/I harflerini yanlış çevirir. Bu fonksiyon
+    sadece karşılaştırma/anahtar kelime işlemlerinde kullanılıyor,
+    embedding'e giden metinler değiştirilmiyor."""
+    ceviri = str.maketrans("İIĞÜŞÖÇ", "iığüşöç")
+    return text.translate(ceviri).lower()
+
+
+def get_embedding(text):
+    """Embedding alır; sunucuya erişilemezse anlaşılır bir hata fırlatır."""
+    try:
+        resp = client.embeddings.create(input=text, model=EMBED_MODEL)
+        return np.array(resp.data[0].embedding)
+    except Exception as e:
+        raise EmbeddingError(
+            f"Embedding sunucusuna erişilemedi (PORT={PORT} doğru mu, Foundry açık mı?). Detay: {e}"
+        )
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content TEXT NOT NULL,
+            embedding TEXT NOT NULL,
+            source TEXT DEFAULT 'manuel',
+            chunk_index INTEGER DEFAULT 0
+        )
+    ''')
+    mevcut_kolonlar = {row[1] for row in c.execute("PRAGMA table_info(documents)")}
+    if "source" not in mevcut_kolonlar:
+        c.execute("ALTER TABLE documents ADD COLUMN source TEXT DEFAULT 'manuel'")
+    if "chunk_index" not in mevcut_kolonlar:
+        c.execute("ALTER TABLE documents ADD COLUMN chunk_index INTEGER DEFAULT 0")
+    conn.commit()
+    conn.close()
+
+
+@st.cache_resource
+def load_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c = conn.cursor()
+    c.execute('SELECT content, embedding, source FROM documents')
+    rows = c.fetchall()
+    conn.close()
+
+    docs = []
+    for content, emb_str, source in rows:
+        docs.append({
+            "content": content,
+            "embedding": np.array(json.loads(emb_str)),
+            "source": source or "manuel",
+        })
+    return docs
+
+
+def insert_chunk(content, source, chunk_index):
+    """Tek bir metin parçasını embed'le ve veritabanına ekle."""
+    emb = get_embedding(content)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO documents (content, embedding, source, chunk_index) VALUES (?, ?, ?, ?)',
+        (content, json.dumps(emb.tolist()), source, chunk_index)
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_source(source):
+    """Belirli bir kaynağa ait tüm chunk'ları siler (örn. yanlış/eski dosya)."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DELETE FROM documents WHERE source = ?', (source,))
+    conn.commit()
+    conn.close()
+
+
+
+def extract_text(uploaded_file):
+    if uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf"):
+        reader = PdfReader(uploaded_file)
+        metin = ""
+        for sayfa in reader.pages:
+            t = sayfa.extract_text()
+            if t:
+                metin += t + "\n"
+        return metin
+    else:
+        return uploaded_file.read().decode("utf-8", errors="ignore")
+
+
+def _en_iyi_tabloyu_bul(sayfa):
+    """Sayfadaki en güvenilir tabloyu (başlık, veri_satırları) olarak
+    döndürür; tablo bulunamazsa None döner.
+
+    Önce çizgi tabanlı (lines) tablo tespiti dener, olmazsa metin hizası
+    tabanlı (text) tespite geçer — çünkü birçok PDF raporunda (bu rapor
+    dahil) hücreler arasında dikey çizgi yoktur, sadece hizalama vardır ve
+    'lines' stratejisi satırları tek bir bloğa sıkıştırıp sütunları
+    ayıramaz. Ayrıca çok satırlı başlıklar (ör. "SON GELİŞ" / "TARIHI" iki
+    ayrı satıra bölünmüş) sütun bazında birleştirilerek tam başlık adı
+    (ör. "SON GELİŞ TARIHI") yeniden oluşturulur.
+    """
+    for ayarlar in (
+        {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
+        {"vertical_strategy": "text", "horizontal_strategy": "text"},
+    ):
+        try:
+            bulunan_tablolar = sayfa.extract_tables(ayarlar)
+        except Exception:
+            continue
+
+        for tablo in bulunan_tablolar:
+            dolu_satirlar = [r for r in tablo if any((c or "").strip() for c in r)]
+            if len(dolu_satirlar) < 2:
+                continue
+
+            sayilar = Counter(sum(1 for c in r if (c or "").strip()) for r in dolu_satirlar)
+            mod_sayi, mod_adet = sayilar.most_common(1)[0]
+            if mod_sayi < 2 or mod_adet < 2:
+                continue
+
+            ilk_tam_idx = next(
+                i for i, r in enumerate(dolu_satirlar)
+                if sum(1 for c in r if (c or "").strip()) == mod_sayi
+            )
+            ncols = len(dolu_satirlar[0])
+            baslik_parcalari = dolu_satirlar[:ilk_tam_idx + 1]
+            baslik = []
+            for col in range(ncols):
+                parcalar = [(r[col] or "").replace("\n", " ").strip() for r in baslik_parcalari]
+                baslik.append(" ".join(p for p in parcalar if p).strip())
+
+            veri_satirlari = dolu_satirlar[ilk_tam_idx + 1:]
+            if not veri_satirlari:
+                continue
+            return baslik, veri_satirlari
+    return None
+
+
+def extract_pdf_chunks(uploaded_file):
+    
+    chunks = []
+    uploaded_file.seek(0)
+    with pdfplumber.open(uploaded_file) as pdf:
+        for sayfa in pdf.pages:
+            tablo = _en_iyi_tabloyu_bul(sayfa)
+            if tablo:
+                baslik, veri_satirlari = tablo
+                satir_metinleri = []
+                for row in veri_satirlari:
+                    hucreler = [(c or "").replace("\n", " ").strip() for c in row]
+                    if sum(1 for h in hucreler if h) <= 1:
+                        continue  # neredeyse boş satır, muhtemelen ayraç
+                    etiketli = ", ".join(
+                        f"{h}: {v}" for h, v in zip(baslik, hucreler) if h and v
+                    )
+                    if not etiketli:
+                        continue
+                    chunks.append(f"Kayıt — {etiketli}")
+                    satir_metinleri.append(etiketli)
+
+                if satir_metinleri:
+                    birlesik = "Tablo (tüm satırlar bir arada):\n" + "\n".join(
+                        f"{i+1}. {s}" for i, s in enumerate(satir_metinleri)
+                    )
+                    if len(birlesik) <= 6000:
+                        chunks.append(birlesik)
+                    else:
+                        chunks.extend(chunk_text(birlesik, chunk_size=1500, overlap_sentences=0))
+
+            
+            sayfa_metni = sayfa.extract_text() or ""
+            if sayfa_metni.strip():
+                chunks.extend(chunk_text(sayfa_metni))
+
+    return chunks
+
+
+def chunk_text(tum_metin, chunk_size=800, overlap_sentences=2):
+    
+    chunks = []
+    paragraflar = re.split(r"\n\s*\n", tum_metin)
+
+    mevcut_cumleler = []
+    mevcut_uzunluk = 0
+
+    for paragraf in paragraflar:
+        paragraf = paragraf.strip()
+        if not paragraf:
+            continue
+        cumleler = re.split(r"(?<=[.!?])\s+", paragraf)
+        for cumle in cumleler:
+            cumle = cumle.strip()
+            if not cumle:
+                continue
+
+            
+            if len(cumle) > chunk_size:
+                if mevcut_cumleler:
+                    chunks.append(" ".join(mevcut_cumleler))
+                    mevcut_cumleler = []
+                    mevcut_uzunluk = 0
+                for i in range(0, len(cumle), chunk_size):
+                    chunks.append(cumle[i:i + chunk_size])
+                continue
+
+            if mevcut_uzunluk + len(cumle) <= chunk_size:
+                mevcut_cumleler.append(cumle)
+                mevcut_uzunluk += len(cumle) + 1
+            else:
+                if mevcut_cumleler:
+                    chunks.append(" ".join(mevcut_cumleler))
+                overlap = mevcut_cumleler[-overlap_sentences:]
+                mevcut_cumleler = overlap + [cumle]
+                mevcut_uzunluk = sum(len(x) + 1 for x in mevcut_cumleler)
+
+    if mevcut_cumleler:
+        chunks.append(" ".join(mevcut_cumleler))
+
+    return chunks
+
+
+def ingest_file(uploaded_file):
+    dosya_pdf_mi = (
+        uploaded_file.type == "application/pdf" or uploaded_file.name.lower().endswith(".pdf")
+    )
+
+    if dosya_pdf_mi:
+        try:
+            parcalar = extract_pdf_chunks(uploaded_file)
+        except Exception as e:
+           
+            st.warning(f"⚠️ '{uploaded_file.name}' tablo-farkında okunamadı, düz metin olarak deneniyor. Detay: {e}")
+            uploaded_file.seek(0)
+            metin = extract_text(uploaded_file)
+            parcalar = chunk_text(metin) if metin.strip() else []
+    else:
+        metin = extract_text(uploaded_file)
+        parcalar = chunk_text(metin) if metin.strip() else []
+
+    if not parcalar:
+        st.warning(f"⚠️ '{uploaded_file.name}' içinden metin çıkarılamadı (taranmış görsel PDF olabilir).")
+        return 0
+
+    progress = st.progress(0, text=f"{uploaded_file.name} işleniyor...")
+    for i, parca in enumerate(parcalar):
+        insert_chunk(parca, source=uploaded_file.name, chunk_index=i)
+        progress.progress((i + 1) / len(parcalar), text=f"{uploaded_file.name}: {i+1}/{len(parcalar)} parça")
+    progress.empty()
+    return len(parcalar)
+
+
+
+def retrieve_relevant_chunks(query, documents, top_k=5, keyword_boost=0.15):
+    query_emb = get_embedding(query)
+
+    query_words = {w for w in re.findall(r"\w+", turkish_lower(query)) if len(w) > 2}
+
+    scored = []
+    for doc in documents:
+        semantic_score = cosine_similarity(query_emb, doc["embedding"])
+        doc_words = set(re.findall(r"\w+", turkish_lower(doc["content"])))
+        overlap = len(query_words & doc_words)
+        total_score = semantic_score + overlap * keyword_boost
+        scored.append({
+            "content": doc["content"],
+            "source": doc["source"],
+            "semantic": semantic_score,
+            "score": total_score,
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]
+
+
+def answer_query(query, documents):
+    sayma_kelimeleri = ["kaç tane", "kaç hasta", "toplam kaç", "kaç kayıt", "kaç kişi"]
+    if any(kelime in turkish_lower(query) for kelime in sayma_kelimeleri):
+        return (
+            f"Toplam {len(documents)} kayıt/parça bulunuyor. "
+            "(Not: bu, hasta sayısı değil kayıt/chunk sayısıdır.)"
+        )
+
+    if not documents:
+        return "Henüz hiç kaynak eklenmemiş. Önce bir doküman yükleyin veya manuel kayıt girin."
+
+    try:
+        results = retrieve_relevant_chunks(query, documents, top_k=5)
+    except EmbeddingError as e:
+        st.error(str(e))
+        return "Bir hata oluştu, cevap üretilemedi."
+
+    # Ucuz bir ön-filtre: en iyi eşleşme bile çok düşükse LLM'i hiç çağırma.
+    if not results or results[0]["semantic"] < MIN_SEMANTIC_SCORE:
+        return "Buna dair bir bilgi bulamadım."
+
+    top_matches = results[:3]
+    context = "\n\n---\n\n".join(
+        f"[Kaynak: {r['source']}]\n{r['content']}" for r in top_matches
+    )
+
+    prompt = f"""Sen bir asistansın. Sadece aşağıdaki Metin parçalarına göre Soruyu Türkçe cevapla.
+
+Metinde AÇIKÇA belirtilen bir bilgiyi kullanarak soruyu cevaplaman yeterlidir, bu "uydurmak"
+sayılmaz — sorunun kelimeleriyle metindeki kelimeler birebir aynı olmasa bile, metinde o soruyu
+açıkça cevaplayan bir bilgi (bir alan/sütun değeri) varsa onu kullan.
+"Uydurma" demek, metinde hiç yer almayan bir bilgiyi (tarih, sayı, teşhis, ilaç, şikayet vb.)
+icat etmen demektir; metinde zaten yazan bir bilgiyi soruya uyarlaman değil.
+
+Metin parçaları birden fazla kişiye/kayda ait olabilir. Soru belirli bir isme veya kayda özgüyse,
+SADECE o kişiye/kayda ait metin parçasındaki bilgiyi kullan; başka kişilere ait bilgileri
+KESİNLİKLE karıştırma veya oraya ait olmayan bir bilgiyi cevaba taşıma.
+Mümkünse hangi kaynaktan aldığını belirt.
+Yorum yapma, sadece cevabı ver.
+
+Eğer metin parçalarının HİÇBİRİNDE soruyla ilgili hiçbir bilgi yoksa, başka HİÇBİR ŞEY yazmadan
+sadece şunu yaz: {NOT_FOUND_MARKER}
+
+Metin parçaları:
+{context}
+
+Soru: {query}
+
+Cevap:"""
+
+    try:
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=300,
+        )
+    except Exception as e:
+        st.error(f"Sohbet sunucusuna erişilemedi (PORT={PORT} doğru mu?). Detay: {e}")
+        return "Bir hata oluştu, cevap üretilemedi."
+
+    answer_text = response.choices[0].message.content
+
+    with st.expander("🔍 Debug — bulunan kayıtlar ve ham cevap"):
+        for i, r in enumerate(results, 1):
+            st.caption(
+                f"{i}. Kaynak: {r['source']} | Semantik: {r['semantic']:.3f} | "
+                f"Toplam: {r['score']:.3f} | \"{r['content'][:80]}...\""
+            )
+        st.caption(f"Ham LLM cevabı: {answer_text!r}")
+
+    if not answer_text or NOT_FOUND_MARKER in answer_text:
+        return "Buna dair bir bilgi bulamadım."
+
+    if dejenere_tekrar_mi(answer_text):
+        return "Model bir tekrar döngüsüne girdi, net bir cevap üretemedi. Soruyu biraz daha net/kısa sorup tekrar deneyebilirsin."
+
+    return answer_text
+
+
+st.set_page_config(page_title="Hasta Takip Sistemi", page_icon="🏥")
+st.title("🏥 Hasta Takip Sistemi")
+
+init_db()
+documents = load_db()
+
+with st.sidebar:
+    st.header("📄 Kaynak Doküman Yükle")
+    yuklenen_dosyalar = st.file_uploader(
+        "PDF veya TXT dosyası (kılavuz, rapor vb.)",
+        type=["pdf", "txt"],
+        accept_multiple_files=True,
+    )
+    mevcut_kaynaklar = {d["source"] for d in documents}
+    uzerine_yaz = st.checkbox(
+        "Aynı isimli kaynak zaten varsa silip yeniden ekle", value=False
+    )
+    if st.button("Dokümanları İşle ve Ekle") and yuklenen_dosyalar:
+        toplam_parca = 0
+        atlanan = []
+        for dosya in yuklenen_dosyalar:
+            if dosya.name in mevcut_kaynaklar:
+                if uzerine_yaz:
+                    delete_source(dosya.name)
+                else:
+                    atlanan.append(dosya.name)
+                    continue
+            try:
+                toplam_parca += ingest_file(dosya)
+            except EmbeddingError as e:
+                st.error(str(e))
+                break
+        if atlanan:
+            st.info("Zaten yüklü olduğu için atlandı: " + ", ".join(atlanan) +
+                     " (üzerine yazmak için yukarıdaki kutuyu işaretleyin)")
+        st.cache_resource.clear()
+        if toplam_parca:
+            st.success(f"✅ {toplam_parca} parça eklendi!")
+        st.rerun()
+
+    st.divider()
+    st.header("📝 Yeni Hasta Kaydı (manuel)")
+    yeni_kayit = st.text_area("Hastanın durumunu yazın:")
+    if st.button("Veritabanına Ekle"):
+        if yeni_kayit.strip():
+            try:
+                insert_chunk(yeni_kayit, source="manuel", chunk_index=0)
+                st.cache_resource.clear()
+                st.success("✅ Kayıt başarıyla eklendi!")
+                st.rerun()
+            except EmbeddingError as e:
+                st.error(str(e))
+        else:
+            st.warning("Boş kayıt eklenemez.")
+
+    st.divider()
+    st.header("📚 Yüklü Kaynaklar")
+    if documents:
+        kaynak_sayilari = {}
+        for d in documents:
+            kaynak_sayilari[d["source"]] = kaynak_sayilari.get(d["source"], 0) + 1
+        for kaynak, adet in sorted(kaynak_sayilari.items(), key=lambda x: -x[1]):
+            col1, col2 = st.columns([4, 1])
+            col1.caption(f"• {kaynak} — {adet} parça")
+            if col2.button("🗑️", key=f"sil_{kaynak}", help=f"'{kaynak}' kaynağını sil"):
+                delete_source(kaynak)
+                st.cache_resource.clear()
+                st.rerun()
+    else:
+        st.caption("Henüz kaynak yok.")
+
+query = st.chat_input("Hasta hakkında soru sorun...")
+if query:
+    st.chat_message("user").write(query)
+    with st.chat_message("assistant"):
+        answer = answer_query(query, documents)
+        st.write(answer)
