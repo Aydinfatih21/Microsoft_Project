@@ -3,8 +3,6 @@ import json
 import numpy as np
 from openai import OpenAI
 
-# ⚠️ TEK DİKKAT EDECEĞİN YER BURASI ⚠️
-# Siyah ekranda (Foundry) yazan kapı numarasını buraya yaz:
 PORT = 51592
 
 client = OpenAI(base_url=f"http://127.0.0.1:{PORT}/v1", api_key="local-key")
